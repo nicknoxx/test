@@ -1,0 +1,627 @@
+#!/usr/bin/env python3
+"""
+Queue Monitor Script
+Launches headless browsers to monitor queue information and save to Google Sheets
+"""
+
+import asyncio
+import json
+import time
+import random
+from datetime import datetime
+from typing import List, Dict, Optional
+from dataclasses import dataclass
+from pathlib import Path
+
+# Third-party imports
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException, NoSuchElementException
+from webdriver_manager.chrome import ChromeDriverManager
+import gspread
+from google.oauth2.service_account import Credentials
+
+# ========== CONFIGURATION ==========
+# Easy to modify settings
+CONFIG = {
+    "NUM_BROWSERS": 5,  # Change this to modify number of browsers
+    "TARGET_URL": "https://static.assets-queue-it.net/cloudflare/cf01.html",  # Change this to modify target URL
+    "WAIT_TIMEOUT": 10,  # Seconds to wait for elements
+    "REFRESH_INTERVAL": 30,  # Seconds between refreshes
+    "SCRAPE_INTERVAL": 60,  # Seconds to wait between scrapes (1 minute)
+    "NUM_SCRAPES": 2,  # Number of scrapes to perform
+    "GOOGLE_SHEET_NAME": "Queue Monitor",  # CHANGE THIS to your existing sheet name
+    "WORKSHEET_NAME": "Queue Data",  # Name of the worksheet
+    "DEBUG_SAVE_HTML": False,  # Set to True to save HTML files for debugging
+    "BROWSER_LAUNCH_DELAY_MIN": 0.0,  # Minimum delay between browser launches (seconds)
+    "BROWSER_LAUNCH_DELAY_MAX": 1.0,  # Maximum delay between browser launches (seconds)
+    "SERVICE_ACCOUNT_KEY_FILE": "./google_service_account.json",  # Path to your JSON key file
+}
+
+# Queue elements to search for
+QUEUE_ELEMENTS = [
+    "QueueNumberText",
+    "QueueNumber", 
+    "UsersInLineAheadOfYouText",
+    "UsersInLineAheadOfYou",
+    "QueueID"
+]
+
+# ========== DATA STRUCTURES ==========
+@dataclass
+class QueueData:
+    """Data structure to hold queue information"""
+    browser_id: int
+    queue_number_text: Optional[str] = None
+    queue_number: Optional[int] = None
+    users_in_line_ahead_text: Optional[str] = None
+    users_in_line_ahead: Optional[int] = None
+    queue_id: Optional[str] = None
+    timestamp: Optional[str] = None
+
+
+def load_service_account_credentials() -> Dict:
+    """Load Google service account credentials from external JSON file"""
+    key_file_path = Path(CONFIG["SERVICE_ACCOUNT_KEY_FILE"])
+    
+    if not key_file_path.exists():
+        raise FileNotFoundError(
+            f"Google service account key file not found: {key_file_path}\n"
+            f"Please ensure you have downloaded your service account key file "
+            f"and placed it at: {key_file_path.absolute()}\n"
+            f"You can download this from Google Cloud Console > IAM & Admin > Service Accounts"
+        )
+    
+    try:
+        with open(key_file_path, 'r') as f:
+            credentials = json.load(f)
+        
+        # Validate that it's a proper service account key
+        required_fields = ['type', 'project_id', 'private_key', 'client_email']
+        missing_fields = [field for field in required_fields if field not in credentials]
+        
+        if missing_fields:
+            raise ValueError(
+                f"Invalid service account key file. Missing required fields: {missing_fields}\n"
+                f"Please ensure you downloaded a proper service account key JSON file."
+            )
+        
+        if credentials['type'] != 'service_account':
+            raise ValueError(
+                f"Invalid key file type: {credentials.get('type')}. "
+                f"Expected 'service_account'."
+            )
+        
+        print(f"Successfully loaded service account credentials from: {key_file_path}")
+        print(f"Service account email: {credentials['client_email']}")
+        
+        return credentials
+        
+    except json.JSONDecodeError as e:
+        raise ValueError(
+            f"Invalid JSON in service account key file: {e}\n"
+            f"Please ensure the file is valid JSON."
+        )
+    except Exception as e:
+        raise Exception(f"Error loading service account credentials: {e}")
+
+
+class BrowserManager:
+    """Manages individual browser instances"""
+    
+    def __init__(self, browser_id: int):
+        self.browser_id = browser_id
+        self.driver = None
+        self.is_active = False
+    
+    def start_browser(self) -> bool:
+        """Start a headless Chrome browser"""
+        try:
+            options = Options()
+            options.add_argument("--headless")
+            options.add_argument("--no-sandbox")
+            options.add_argument("--disable-dev-shm-usage")
+            options.add_argument("--disable-gpu")
+            options.add_argument("--window-size=1920,1080")
+            options.add_argument("--disable-blink-features=AutomationControlled")
+            
+            # Error suppression options
+            options.add_argument("--disable-backgrounding-occluded-windows")
+            options.add_argument("--disable-background-timer-throttling")
+            options.add_argument("--disable-features=TranslateUI")
+            options.add_argument("--disable-ipc-flooding-protection")
+            options.add_argument("--disable-logging")
+            options.add_argument("--log-level=3")  # Suppress INFO, WARNING, ERROR
+            options.add_argument("--silent")
+            
+            options.add_experimental_option("excludeSwitches", ["enable-automation", "enable-logging"])
+            options.add_experimental_option('useAutomationExtension', False)
+            
+            service = Service(ChromeDriverManager().install())
+            self.driver = webdriver.Chrome(service=service, options=options)
+            self.driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+            
+            self.is_active = True
+            print(f"Browser {self.browser_id} started successfully")
+            return True
+            
+        except Exception as e:
+            print(f"Error starting browser {self.browser_id}: {e}")
+            return False
+    
+    def navigate_to_url(self, url: str) -> bool:
+        """Navigate to the specified URL"""
+        try:
+            if not self.is_active:
+                return False
+                
+            self.driver.get(url)
+            print(f"Browser {self.browser_id} navigated to {url}")
+            return True
+            
+        except Exception as e:
+            print(f"Error navigating browser {self.browser_id}: {e}")
+            return False
+    
+    def extract_queue_data(self) -> QueueData:
+        """Extract queue data from the current page"""
+        queue_data = QueueData(browser_id=self.browser_id)
+        queue_data.timestamp = datetime.now().isoformat()
+        
+        if not self.is_active:
+            return queue_data
+        
+        try:
+            # Wait for page to load
+            WebDriverWait(self.driver, CONFIG["WAIT_TIMEOUT"]).until(
+                EC.presence_of_element_located((By.TAG_NAME, "body"))
+            )
+            
+            # Debug: Print page title and URL
+            print(f"Browser {self.browser_id} - Page title: {self.driver.title}")
+            print(f"Browser {self.browser_id} - Current URL: {self.driver.current_url}")
+            
+            # Get the entire page text
+            page_text = self.driver.find_element(By.TAG_NAME, "body").text
+            
+            # Debug: Save page source if enabled
+            if CONFIG.get("DEBUG_SAVE_HTML", False):
+                with open(f"debug_page_{self.browser_id}.html", "w", encoding="utf-8") as f:
+                    f.write(self.driver.page_source)
+                with open(f"debug_text_{self.browser_id}.txt", "w", encoding="utf-8") as f:
+                    f.write(page_text)
+                print(f"Browser {self.browser_id} - Saved page source and text")
+            
+            # Extract queue information using regex patterns
+            import re
+            found_any = False
+            
+            # Pattern 1: "Your number in line: 594"
+            number_match = re.search(r'Your number in line:\s*(\d+)', page_text, re.IGNORECASE)
+            if number_match:
+                queue_data.queue_number = int(number_match.group(1))
+                print(f"Browser {self.browser_id} found queue number: {queue_data.queue_number}")
+                found_any = True
+            
+            # Pattern 2: "Number of users in line ahead of you: 112"
+            ahead_match = re.search(r'Number of users in line ahead of you:\s*(\d+)', page_text, re.IGNORECASE)
+            if ahead_match:
+                queue_data.users_in_line_ahead = int(ahead_match.group(1))
+                print(f"Browser {self.browser_id} found users ahead: {queue_data.users_in_line_ahead}")
+                found_any = True
+            
+            # Pattern 3: "Queue ID: bc05b1da-821f-4944-a4bd-567a6b74d03b"
+            queue_id_match = re.search(r'Queue ID:\s*([a-f0-9-]+)', page_text, re.IGNORECASE)
+            if queue_id_match:
+                queue_data.queue_id = queue_id_match.group(1)
+                print(f"Browser {self.browser_id} found queue ID: {queue_data.queue_id}")
+                found_any = True
+            
+            # Pattern 4: "Expected arrival time on the website: 5:01 PM"
+            arrival_time_match = re.search(r'Expected arrival time on the website:\s*([^*\n]+)', page_text, re.IGNORECASE)
+            if arrival_time_match:
+                queue_data.queue_number_text = f"Expected arrival: {arrival_time_match.group(1).strip()}"
+                print(f"Browser {self.browser_id} found arrival time: {arrival_time_match.group(1).strip()}")
+                found_any = True
+            
+            # Pattern 5: "Your estimated wait time is: 1 minute"
+            wait_time_match = re.search(r'Your estimated wait time is:\s*([^*\n]+)', page_text, re.IGNORECASE)
+            if wait_time_match:
+                queue_data.users_in_line_ahead_text = f"Wait time: {wait_time_match.group(1).strip()}"
+                print(f"Browser {self.browser_id} found wait time: {wait_time_match.group(1).strip()}")
+                found_any = True
+            
+            # Try to find the original specific elements as fallback
+            if not found_any:
+                found_any = self.search_specific_elements(queue_data)
+            
+            # If we still didn't find anything, do broader search
+            if not found_any:
+                print(f"Browser {self.browser_id} - No queue elements found, performing broader search...")
+                self.debug_page_content()
+                        
+        except TimeoutException:
+            print(f"Browser {self.browser_id} timed out waiting for page to load")
+        except Exception as e:
+            print(f"Error extracting data from browser {self.browser_id}: {e}")
+        
+        return queue_data
+    
+    def search_specific_elements(self, queue_data: QueueData) -> bool:
+        """Search for specific HTML elements (fallback method)"""
+        found_any = False
+        
+        for element_name in QUEUE_ELEMENTS:
+            found_element = False
+            
+            # Try multiple search strategies
+            search_strategies = [
+                (By.ID, element_name),
+                (By.CLASS_NAME, element_name),
+                (By.NAME, element_name),
+                (By.CSS_SELECTOR, f"[id*='{element_name}']"),
+                (By.CSS_SELECTOR, f"[class*='{element_name}']"),
+                (By.XPATH, f"//*[contains(@id, '{element_name}')]"),
+                (By.XPATH, f"//*[contains(@class, '{element_name}')]"),
+                (By.XPATH, f"//*[contains(text(), '{element_name}')]"),
+            ]
+            
+            for strategy, selector in search_strategies:
+                try:
+                    element = self.driver.find_element(strategy, selector)
+                    value = element.text or element.get_attribute("value") or element.get_attribute("innerHTML")
+                    
+                    if value and value.strip():  # Only proceed if we have actual content
+                        # Store the value based on element name
+                        if element_name == "QueueNumberText":
+                            queue_data.queue_number_text = value.strip()
+                        elif element_name == "QueueNumber":
+                            try:
+                                # Extract numbers from the text
+                                import re
+                                numbers = re.findall(r'\d+', value)
+                                queue_data.queue_number = int(numbers[0]) if numbers else None
+                            except (ValueError, IndexError):
+                                queue_data.queue_number = None
+                        elif element_name == "UsersInLineAheadOfYouText":
+                            queue_data.users_in_line_ahead_text = value.strip()
+                        elif element_name == "UsersInLineAheadOfYou":
+                            try:
+                                # Extract numbers from the text
+                                import re
+                                numbers = re.findall(r'\d+', value)
+                                queue_data.users_in_line_ahead = int(numbers[0]) if numbers else None
+                            except (ValueError, IndexError):
+                                queue_data.users_in_line_ahead = None
+                        elif element_name == "QueueID":
+                            queue_data.queue_id = value.strip()
+                        
+                        print(f"Browser {self.browser_id} found {element_name} ({strategy}): {value.strip()}")
+                        found_element = True
+                        found_any = True
+                        break  # Found it, no need to try other strategies
+                        
+                except NoSuchElementException:
+                    continue
+                except Exception as e:
+                    print(f"Browser {self.browser_id} error searching for {element_name}: {e}")
+                    continue
+            
+            if not found_element:
+                print(f"Browser {self.browser_id} could not find {element_name} with any strategy")
+        
+        return found_any
+    
+    def debug_page_content(self):
+        """Debug function to analyze page content"""
+        try:
+            # Look for any elements that might contain queue information
+            potential_selectors = [
+                "div", "span", "p", "input", "textarea", "select"
+            ]
+            
+            print(f"Browser {self.browser_id} - Analyzing page content...")
+            
+            for selector in potential_selectors:
+                elements = self.driver.find_elements(By.TAG_NAME, selector)
+                for element in elements[:20]:  # Limit to first 20 elements
+                    try:
+                        text = element.text or element.get_attribute("value") or ""
+                        element_id = element.get_attribute("id") or ""
+                        element_class = element.get_attribute("class") or ""
+                        
+                        # Look for queue-related keywords
+                        queue_keywords = ["queue", "wait", "line", "ahead", "number", "id", "position"]
+                        if any(keyword.lower() in text.lower() or 
+                               keyword.lower() in element_id.lower() or 
+                               keyword.lower() in element_class.lower() 
+                               for keyword in queue_keywords):
+                            print(f"  Found potential queue element: {selector}")
+                            print(f"    ID: {element_id}")
+                            print(f"    Class: {element_class}")
+                            print(f"    Text: {text[:100]}...")
+                            
+                    except Exception:
+                        continue
+                        
+        except Exception as e:
+            print(f"Error in debug analysis: {e}")
+    
+    def close(self):
+        """Close the browser"""
+        if self.driver:
+            try:
+                self.driver.quit()
+                print(f"Browser {self.browser_id} closed")
+            except Exception as e:
+                print(f"Error closing browser {self.browser_id}: {e}")
+        self.is_active = False
+
+
+class GoogleSheetsManager:
+    """Manages Google Sheets operations"""
+    
+    def __init__(self):
+        self.client = None
+        self.spreadsheet = None
+        self.worksheet = None
+        self.service_account_info = None
+    
+    def initialize(self) -> bool:
+        """Initialize Google Sheets connection"""
+        try:
+            # Load service account credentials from external file
+            self.service_account_info = load_service_account_credentials()
+            
+            # Set up credentials with broader scopes
+            credentials = Credentials.from_service_account_info(
+                self.service_account_info,
+                scopes=[
+                    'https://www.googleapis.com/auth/spreadsheets',
+                    'https://www.googleapis.com/auth/drive',
+                    'https://www.googleapis.com/auth/drive.file'
+                ]
+            )
+            
+            self.client = gspread.authorize(credentials)
+            print("Successfully authorized with Google Sheets API")
+            
+            # Try to open existing spreadsheet first
+            try:
+                self.spreadsheet = self.client.open(CONFIG["GOOGLE_SHEET_NAME"])
+                print(f"Opened existing spreadsheet: {CONFIG['GOOGLE_SHEET_NAME']}")
+            except gspread.SpreadsheetNotFound:
+                print(f"Spreadsheet '{CONFIG['GOOGLE_SHEET_NAME']}' not found.")
+                print("Please create a Google Sheet manually and share it with:")
+                print(f"  {self.service_account_info['client_email']}")
+                print("Give it Editor permissions, then update CONFIG['GOOGLE_SHEET_NAME'] with the exact sheet name.")
+                return False
+            
+            # Try to open existing worksheet, create if it doesn't exist
+            try:
+                self.worksheet = self.spreadsheet.worksheet(CONFIG["WORKSHEET_NAME"])
+                print(f"Using existing worksheet: {CONFIG['WORKSHEET_NAME']}")
+            except gspread.WorksheetNotFound:
+                try:
+                    self.worksheet = self.spreadsheet.add_worksheet(
+                        title=CONFIG["WORKSHEET_NAME"],
+                        rows=1000,
+                        cols=10
+                    )
+                    # Add headers
+                    headers = [
+                        "Timestamp", "Browser ID", "Queue Number", "Queue Number Text",
+                        "Users Ahead", "Users Ahead Text", "Queue ID"
+                    ]
+                    self.worksheet.insert_row(headers, 1)
+                    print(f"Created new worksheet: {CONFIG['WORKSHEET_NAME']}")
+                except Exception as e:
+                    print(f"Error creating worksheet: {e}")
+                    print("Using first available worksheet...")
+                    self.worksheet = self.spreadsheet.sheet1
+            
+            return True
+            
+        except Exception as e:
+            print(f"Error initializing Google Sheets: {e}")
+            print("\nTroubleshooting steps:")
+            print("1. Ensure your service account key file exists and is valid")
+            print(f"2. File should be located at: {Path(CONFIG['SERVICE_ACCOUNT_KEY_FILE']).absolute()}")
+            print("3. Create a Google Sheet manually")
+            print(f"4. Share it with: {self.service_account_info.get('client_email', 'your-service-account-email') if self.service_account_info else 'your-service-account-email'}")
+            print("5. Give it Editor permissions")
+            print("6. Update CONFIG['GOOGLE_SHEET_NAME'] with the exact sheet name")
+            return False
+    
+    def save_queue_data(self, queue_data_list: List[QueueData]) -> bool:
+        """Save queue data to Google Sheets"""
+        try:
+            if not self.worksheet:
+                print("Worksheet not initialized")
+                return False
+            
+            # Sort by queue number (ascending)
+            sorted_data = sorted(
+                queue_data_list, 
+                key=lambda x: x.queue_number if x.queue_number is not None else float('inf')
+            )
+            
+            # Prepare rows for insertion
+            rows_to_insert = []
+            for data in sorted_data:
+                row = [
+                    data.timestamp,
+                    data.browser_id,
+                    data.queue_number,
+                    data.queue_number_text,
+                    data.users_in_line_ahead,
+                    data.users_in_line_ahead_text,
+                    data.queue_id
+                ]
+                rows_to_insert.append(row)
+            
+            # Insert all rows at once
+            if rows_to_insert:
+                self.worksheet.insert_rows(rows_to_insert, 2)  # Insert after header
+                print(f"Saved {len(rows_to_insert)} queue data records to Google Sheets")
+                return True
+            
+        except Exception as e:
+            print(f"Error saving to Google Sheets: {e}")
+            return False
+        
+        return False
+
+
+def wait_for_user_input(message: str = "Press Enter to start scraping...") -> None:
+    """Wait for user to press Enter"""
+    try:
+        input(message)
+    except KeyboardInterrupt:
+        raise KeyboardInterrupt("User interrupted during input")
+
+
+def countdown_timer(seconds: int) -> None:
+    """Display a countdown timer"""
+    print(f"Waiting {seconds} seconds before next scrape...")
+    for remaining in range(seconds, 0, -1):
+        mins, secs = divmod(remaining, 60)
+        timer = f"{mins:02d}:{secs:02d}"
+        print(f"\rTime remaining: {timer}", end="", flush=True)
+        time.sleep(1)
+    print("\nTime's up! Starting next scrape...")
+
+
+class QueueMonitor:
+    """Main queue monitoring class"""
+    
+    def __init__(self):
+        self.browsers: List[BrowserManager] = []
+        self.sheets_manager = GoogleSheetsManager()
+    
+    def initialize(self) -> bool:
+        """Initialize all components"""
+        print("Initializing Queue Monitor...")
+        
+        # Initialize Google Sheets
+        if not self.sheets_manager.initialize():
+            print("Failed to initialize Google Sheets")
+            return False
+        
+        # Initialize browsers with random delays
+        print(f"Starting {CONFIG['NUM_BROWSERS']} browsers...")
+        for i in range(CONFIG['NUM_BROWSERS']):
+            # Add random delay before starting each browser (except the first one)
+            if i > 0:
+                delay = random.uniform(CONFIG["BROWSER_LAUNCH_DELAY_MIN"], CONFIG["BROWSER_LAUNCH_DELAY_MAX"])
+                print(f"Waiting {delay:.2f}s before starting browser {i + 1}...")
+                time.sleep(delay)
+            
+            browser = BrowserManager(i + 1)
+            if browser.start_browser():
+                self.browsers.append(browser)
+            else:
+                print(f"Failed to start browser {i + 1}")
+        
+        if not self.browsers:
+            print("No browsers started successfully")
+            return False
+        
+        print(f"Successfully started {len(self.browsers)} browsers")
+        return True
+    
+    def run_monitoring_cycle(self, scrape_number: int) -> bool:
+        """Run one cycle of monitoring"""
+        print(f"\nStarting monitoring cycle #{scrape_number} at {datetime.now()}")
+        
+        # Navigate all browsers to target URL
+        for browser in self.browsers:
+            browser.navigate_to_url(CONFIG["TARGET_URL"])
+        
+        # Wait a bit for pages to load
+        time.sleep(2)
+        
+        # Extract data from all browsers
+        queue_data_list = []
+        for browser in self.browsers:
+            data = browser.extract_queue_data()
+            queue_data_list.append(data)
+        
+        # Save to Google Sheets
+        if queue_data_list:
+            self.sheets_manager.save_queue_data(queue_data_list)
+        
+        # Print summary
+        active_queues = [d for d in queue_data_list if d.queue_id or d.queue_number]
+        print(f"Monitoring cycle #{scrape_number} completed. Found {len(active_queues)} active queues.")
+        
+        return True
+    
+    def run_multiple_scrapes(self):
+        """Run multiple scraping sessions with intervals"""
+        print("Starting multiple scraping sessions...")
+        print(f"Monitoring URL: {CONFIG['TARGET_URL']}")
+        print(f"Will perform {CONFIG['NUM_SCRAPES']} scrapes with {CONFIG['SCRAPE_INTERVAL']} second intervals")
+        print("=" * 50)
+        
+        try:
+            # Wait for user input before starting
+            print("\nBrowsers are ready!")
+            wait_for_user_input("Press Enter to start scraping...")
+            
+            # Run multiple monitoring cycles
+            for scrape_num in range(1, CONFIG['NUM_SCRAPES'] + 1):
+                self.run_monitoring_cycle(scrape_num)
+                
+                # If not the last scrape, wait for the interval
+                if scrape_num < CONFIG['NUM_SCRAPES']:
+                    print(f"\nCompleted scrape {scrape_num}/{CONFIG['NUM_SCRAPES']}")
+                    countdown_timer(CONFIG['SCRAPE_INTERVAL'])
+                else:
+                    print(f"\nCompleted final scrape {scrape_num}/{CONFIG['NUM_SCRAPES']}")
+            
+            print("\nAll scraping sessions completed successfully!")
+            
+        except KeyboardInterrupt:
+            print("\nScraping interrupted by user")
+        except Exception as e:
+            print(f"Error during scraping: {e}")
+    
+    def cleanup(self):
+        """Clean up resources"""
+        print("Cleaning up...")
+        for browser in self.browsers:
+            browser.close()
+        print("Cleanup completed")
+
+
+def main():
+    """Main function"""
+    print("Queue Monitor Starting...")
+    print("=" * 50)
+    
+    monitor = QueueMonitor()
+    
+    try:
+        if monitor.initialize():
+            monitor.run_multiple_scrapes()
+        else:
+            print("Failed to initialize monitor")
+    except FileNotFoundError as e:
+        print(f"\nCRITICAL ERROR: {e}")
+        print("\nSetup Instructions:")
+        print("1. Download your Google service account key file from Google Cloud Console")
+        print("2. Save it as 'google_service_account.json' in the same directory as this script")
+        print(f"3. Or update CONFIG['SERVICE_ACCOUNT_KEY_FILE'] to point to your key file")
+    except Exception as e:
+        print(f"Unexpected error: {e}")
+    finally:
+        monitor.cleanup()
+
+
+if __name__ == "__main__":
+    main()
